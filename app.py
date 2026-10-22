@@ -24,7 +24,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 APP_NAME = "DX Downloader"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 
 BG = "#0B0E13"
 BG2 = "#151A22"
@@ -193,6 +193,15 @@ def is_cloudflare_error(msg: str) -> bool:
     return any(s in msg for s in ("impersonate", "Cloudflare", "HTTP Error 403"))
 
 
+def is_cookie_error(msg: str) -> bool:
+    """Falha ao LER os cookies do navegador (banco travado com o navegador aberto,
+    criptografia nova do Chrome etc.) — não é falha do site; a escada deve seguir."""
+    low = msg.lower()
+    return ("could not copy" in low or "cookie database" in low
+            or "failed to decrypt" in low or "app-bound" in low
+            or "could not extract cookies" in low)
+
+
 def is_instagram_auth_error(url: str, msg: str) -> bool:
     """Instagram responde 'empty media response'/pedindo cookies quando quer login."""
     return "instagram.com" in url and any(
@@ -204,7 +213,8 @@ def build_ydl_opts(mode: str, quality_label: str, out_dir: str,
                    playlist: bool, cookies_browser: str | None,
                    embed_meta: bool, progress_hook, ffmpeg_path: str | None,
                    embed_ok: bool = True, impersonate: str | None = None,
-                   generic_impersonate: bool = False) -> dict:
+                   generic_impersonate: bool = False,
+                   cookies_file: str | None = None) -> dict:
     """Monta as opções do yt-dlp conforme as escolhas da tela. mode: 'video' | 'mp3' | 'm4a'
     embed_ok=False pula capa/metadados (quando falta o ffprobe) em vez de falhar o download.
     impersonate='chrome' imita o navegador (exige curl-cffi) — usado na retentativa anti-Cloudflare."""
@@ -223,7 +233,11 @@ def build_ydl_opts(mode: str, quality_label: str, out_dir: str,
     }
     if ffmpeg_path:
         opts["ffmpeg_location"] = ffmpeg_path
-    if cookies_browser:
+    if cookies_file:
+        # Arquivo cookies.txt exportado do navegador: caminho mais confiável —
+        # não depende de ler o banco do navegador (travado/criptografado).
+        opts["cookiefile"] = cookies_file
+    elif cookies_browser:
         opts["cookiesfrombrowser"] = (cookies_browser,)
     if impersonate:
         opts["impersonate"] = impersonate
@@ -375,10 +389,13 @@ class App(tk.Tk):
         ttk.Checkbutton(extra, text="Baixar playlist inteira", variable=self.playlist_var).pack(side="left")
         ttk.Checkbutton(extra, text="Embutir capa/metadados", variable=self.meta_var).pack(side="left", padx=(14, 0))
         ttk.Label(extra, text="   Cookies do navegador (p/ Instagram/TikTok com login):", style="Card.TLabel").pack(side="left")
-        self.cookies_box = ttk.Combobox(extra, values=["Nenhum", "chrome", "edge", "firefox", "brave"],
-                                        state="readonly", width=9)
+        self.cookies_box = ttk.Combobox(extra, values=["Nenhum", "chrome", "edge", "firefox", "brave", "cookies.txt"],
+                                        state="readonly", width=10)
         self.cookies_box.set("Nenhum")
         self.cookies_box.pack(side="left", padx=(4, 0))
+        self.cookies_file = None
+        self.btn_cookies_file = ttk.Button(extra, text="Arquivo…", command=self._choose_cookies_file)
+        self.btn_cookies_file.pack(side="left", padx=(4, 0))
 
         actions = ttk.Frame(root, padding=(0, 12, 0, 0))
         actions.grid(row=4, column=0, sticky="ew")
@@ -438,6 +455,14 @@ class App(tk.Tk):
         self.url_text.focus_set()
         log_file("link colado na tela")
 
+    def _choose_cookies_file(self):
+        f = filedialog.askopenfilename(parent=self, title="Escolher o arquivo cookies.txt",
+                                       filetypes=[("Cookies", "*.txt"), ("Todos", "*.*")])
+        if f:
+            self.cookies_file = f
+            self.cookies_box.set("cookies.txt")
+            self._log(f"🍪 Arquivo de cookies selecionado: {f}")
+
     def _choose_dir(self):
         d = filedialog.askdirectory(parent=self, initialdir=self.dest_var.get() or str(Path.home()))
         if d:
@@ -482,7 +507,19 @@ class App(tk.Tk):
         self.btn_cancel.configure(state="normal")
         self.progress["value"] = 0
 
-        cookies = None if self.cookies_box.get() == "Nenhum" else self.cookies_box.get()
+        sel = self.cookies_box.get()
+        cookies = None if sel in ("Nenhum", "cookies.txt") else sel
+        cookies_file = None
+        if sel == "cookies.txt":
+            if self.cookies_file and Path(self.cookies_file).exists():
+                cookies_file = self.cookies_file
+            else:
+                messagebox.showwarning(APP_NAME, "Você escolheu cookies.txt mas ainda não apontou o arquivo. "
+                                                 "Clique em 'Arquivo…' e selecione o cookies.txt exportado do navegador.",
+                                       parent=self)
+                self.btn_download.configure(state="normal")
+                self.btn_cancel.configure(state="disabled")
+                return
         args = dict(
             urls=urls,
             mode=self.mode.get(),
@@ -490,6 +527,7 @@ class App(tk.Tk):
             out_dir=out_dir,
             playlist=bool(self.playlist_var.get()),
             cookies_browser=cookies,
+            cookies_file=cookies_file,
             embed_meta=bool(self.meta_var.get()),
         )
         self.worker = threading.Thread(target=self._run_downloads, kwargs=args, daemon=True)
@@ -519,7 +557,7 @@ class App(tk.Tk):
         elif status == "started":
             self.events.put(("log", f"▶ Processando: {Path(str(d.get('filename',''))).name}"))
 
-    def _run_downloads(self, urls, mode, quality_label, out_dir, playlist, cookies_browser, embed_meta):
+    def _run_downloads(self, urls, mode, quality_label, out_dir, playlist, cookies_browser, embed_meta, cookies_file=None):
         try:
             import yt_dlp
             log_file(f"yt-dlp {yt_dlp.version.__version__}")
@@ -542,13 +580,15 @@ class App(tk.Tk):
             self.events.put(("status", f"Baixando {i}/{len(urls)}: {url}"))
             success, err = self._attempt(yt_dlp, url, mode, quality_label, out_dir, playlist,
                                          cookies_browser, embed_meta, ffmpeg_path,
-                                         embed_ok=ffprobe_ok, impersonate=None)
+                                         embed_ok=ffprobe_ok, impersonate=None,
+                                         cookies_file=cookies_file)
             if err == "__cancelled__":
                 self.events.put(("log", "⏹ Cancelado pelo usuário."))
                 break
             # Escada anti-Cloudflare (precisa do curl-cffi embutido):
             # 1) impersonate global  2) + generic:impersonate (o genérico ignora o global na
-            #    página inicial — era o que faltava)  3) + cookies Chrome  4) + cookies Firefox
+            #    página inicial — era o que faltava)  3) + cookies Firefox  4) + cookies Chrome
+            # Erro de LEITURA de cookies não derruba a escada: registra e segue pro próximo degrau.
             if not success and err and is_cloudflare_error(err):
                 try:
                     import curl_cffi  # noqa: F401
@@ -562,15 +602,17 @@ class App(tk.Tk):
                         (dict(impersonate="chrome", generic_impersonate=True),
                          "imitando o Chrome + ajuste do extrator genérico"),
                     ]
-                    if not cookies_browser:
+                    if not cookies_browser and not cookies_file:
                         ladder += [
-                            (dict(impersonate="chrome", generic_impersonate=True, cookies_browser="chrome"),
-                             "imitação + cookies do Chrome"),
                             (dict(impersonate="chrome", generic_impersonate=True, cookies_browser="firefox"),
                              "imitação + cookies do Firefox"),
+                            (dict(impersonate="chrome", generic_impersonate=True, cookies_browser="chrome"),
+                             "imitação + cookies do Chrome"),
                         ]
                     for kwargs, label in ladder:
-                        if success or err == "__cancelled__" or not is_cloudflare_error(err or ""):
+                        if success or err == "__cancelled__":
+                            break
+                        if not (is_cloudflare_error(err or "") or is_cookie_error(err or "")):
                             break
                         self.events.put(("log", f"🛡 Proteção anti-robô (Cloudflare) — tentando de novo: {label}…"))
                         kw = dict(kwargs)
@@ -580,13 +622,16 @@ class App(tk.Tk):
                                                embed_ok=ffprobe_ok, **kw)
                         success = s2
                         if e2:
-                            err = e2
+                            if is_cookie_error(e2):
+                                self.events.put(("log", f"⚠ Não consegui ler os cookies ({label}): feche esse navegador por completo ou use a opção cookies.txt. Seguindo a escada…"))
+                            else:
+                                err = e2
                 else:
                     self.events.put(("log", "ℹ Este site pede imitação de navegador (curl-cffi não embutido neste build). Atualize o workflow e gere o próximo build."))
             # Escada do Instagram: erro de "empty media response" = quer login via cookies.
-            # Se o usuário não escolheu cookies, tenta Chrome e depois Firefox sozinho.
-            if not success and err and not cookies_browser and is_instagram_auth_error(url, err):
-                for browser in ("chrome", "firefox"):
+            # Se o usuário não escolheu cookies, tenta Firefox e depois Chrome sozinho.
+            if not success and err and not cookies_browser and not cookies_file and is_instagram_auth_error(url, err):
+                for browser in ("firefox", "chrome"):
                     if success or err == "__cancelled__":
                         break
                     self.events.put(("log", f"🔑 Instagram pediu login — tentando com os cookies do {browser}…"))
@@ -595,15 +640,19 @@ class App(tk.Tk):
                                            embed_ok=ffprobe_ok, impersonate=None)
                     success = s2
                     if e2:
-                        err = e2
+                        if is_cookie_error(e2):
+                            self.events.put(("log", f"⚠ Não consegui ler os cookies do {browser} (navegador aberto trava o banco). Feche o {browser} por completo ou use a opção cookies.txt."))
+                        else:
+                            err = e2
                 if not success:
-                    self.events.put(("log", "ℹ Pra valer: entre no Instagram pelo **Firefox** uma vez (login) e deixe os cookies salvos — o Chrome novo bloqueia a leitura dos cookies por outros programas; o Firefox não."))
+                    self.events.put(("log", "ℹ Pra valer: entre no Instagram pelo navegador (login feito) e use os cookies dele — ou exporte um cookies.txt do navegador logado e escolha a opção cookies.txt no app: é o caminho mais confiável."))
             # Retentativa de segurança: se o erro citar ffprobe, tenta sem embutir
             if not success and err and "ffprobe" in err:
                 self.events.put(("log", "↪ Tentando de novo sem embutir capa/metadados…"))
                 success, err2 = self._attempt(yt_dlp, url, mode, quality_label, out_dir, playlist,
                                               cookies_browser, embed_meta, ffmpeg_path,
-                                              embed_ok=False, impersonate=None)
+                                              embed_ok=False, impersonate=None,
+                                              cookies_file=cookies_file)
                 if success or err2:
                     err = err2
             if err == "__cancelled__":
@@ -615,19 +664,22 @@ class App(tk.Tk):
             else:
                 fail += 1
                 hint = ""
-                if "instagram.com" in url:
-                    hint = "\n   Dica: entre no Instagram pelo Firefox (login) e nas opções do app escolha cookies = firefox — é o caminho mais confiável hoje."
+                if err and is_cookie_error(err):
+                    hint = "\n   Dica: o app não conseguiu LER os cookies do navegador (ele precisa estar FECHADO por completo pra liberar o banco) — ou use a opção cookies.txt, que não tem esse problema."
+                elif "instagram.com" in url:
+                    hint = "\n   Dica: entre no Instagram pelo navegador (login) e use os cookies dele no app — ou exporte um cookies.txt do navegador logado: é o caminho mais confiável hoje."
                 self.events.put(("log", f"❌ Falhou: {url}\n   Motivo: {(err or '')[:300]}{hint}"))
         self.events.put(("done", ok, fail))
 
     def _attempt(self, yt_dlp, url, mode, quality_label, out_dir, playlist,
                  cookies_browser, embed_meta, ffmpeg_path, embed_ok, impersonate,
-                 generic_impersonate=False):
+                 generic_impersonate=False, cookies_file=None):
         """Uma tentativa de download. Retorna (sucesso, mensagem_de_erro)."""
         opts = build_ydl_opts(mode, quality_label, out_dir, playlist,
                               cookies_browser, embed_meta, self._progress_hook, ffmpeg_path,
                               embed_ok=embed_ok, impersonate=impersonate,
-                              generic_impersonate=generic_impersonate)
+                              generic_impersonate=generic_impersonate,
+                              cookies_file=cookies_file)
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([url])

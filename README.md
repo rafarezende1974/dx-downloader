@@ -22,6 +22,11 @@ Facebook, X (Twitter), Vimeo, Twitch e +1.000 outros (motor: **yt-dlp** + **ffmp
 > do GitHub com o mesmo conteúdo — cópia dele em `WORKFLOW-BUILD-WINDOWS.yml.txt` na raiz.
 
 ## Versões
+- **v1.6.0** — cookies de verdade: nova opção **cookies.txt** nas opções (exporta do navegador logado com uma
+  extensão tipo "Get cookies.txt LOCALLY" e aponta o arquivo no app — não depende de ler o banco do navegador).
+  Escadas mais teimosas: erro de LEITURA de cookies ("Could not copy Chrome cookie database", navegador aberto
+  trava o banco) não derruba mais a escada — registra o aviso e segue pro próximo degrau; na escada do
+  Cloudflare os cookies do Firefox vêm antes dos do Chrome; dicas específicas quando o problema é leitura de cookies.
 - **v1.5.0** — escadas de retentativa: **Cloudflare** (Artlist) — o impersonate global não vale pra página
   inicial do extrator genérico; a escada agora é impersonate → + `generic:impersonate` → + cookies Chrome →
   + cookies Firefox. **Instagram** — "empty media response" é pedido de login: sem cookies escolhidos, o app
