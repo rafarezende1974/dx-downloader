@@ -24,7 +24,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 APP_NAME = "DX Downloader"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 
 BG = "#0B0E13"
 BG2 = "#151A22"
@@ -193,10 +193,18 @@ def is_cloudflare_error(msg: str) -> bool:
     return any(s in msg for s in ("impersonate", "Cloudflare", "HTTP Error 403"))
 
 
+def is_instagram_auth_error(url: str, msg: str) -> bool:
+    """Instagram responde 'empty media response'/pedindo cookies quando quer login."""
+    return "instagram.com" in url and any(
+        s in msg for s in ("empty media response", "use --cookies", "cookies-from-browser",
+                           "login", "Login", "logged-in", "rate-limit", "Rate"))
+
+
 def build_ydl_opts(mode: str, quality_label: str, out_dir: str,
                    playlist: bool, cookies_browser: str | None,
                    embed_meta: bool, progress_hook, ffmpeg_path: str | None,
-                   embed_ok: bool = True, impersonate: str | None = None) -> dict:
+                   embed_ok: bool = True, impersonate: str | None = None,
+                   generic_impersonate: bool = False) -> dict:
     """Monta as opções do yt-dlp conforme as escolhas da tela. mode: 'video' | 'mp3' | 'm4a'
     embed_ok=False pula capa/metadados (quando falta o ffprobe) em vez de falhar o download.
     impersonate='chrome' imita o navegador (exige curl-cffi) — usado na retentativa anti-Cloudflare."""
@@ -219,6 +227,10 @@ def build_ydl_opts(mode: str, quality_label: str, out_dir: str,
         opts["cookiesfrombrowser"] = (cookies_browser,)
     if impersonate:
         opts["impersonate"] = impersonate
+    if generic_impersonate:
+        # O extrator GENÉRICO (sites sem extrator próprio) ignora o impersonate global
+        # na página inicial — ele exige o argumento próprio generic:impersonate.
+        opts["extractor_args"] = {"generic": {"impersonate": [impersonate or "chrome"]}}
     embed = embed_meta and embed_ok
 
     if mode == "video":
@@ -534,7 +546,9 @@ class App(tk.Tk):
             if err == "__cancelled__":
                 self.events.put(("log", "⏹ Cancelado pelo usuário."))
                 break
-            # Retentativa anti-Cloudflare: imita o Chrome (precisa do curl-cffi embutido)
+            # Escada anti-Cloudflare (precisa do curl-cffi embutido):
+            # 1) impersonate global  2) + generic:impersonate (o genérico ignora o global na
+            #    página inicial — era o que faltava)  3) + cookies Chrome  4) + cookies Firefox
             if not success and err and is_cloudflare_error(err):
                 try:
                     import curl_cffi  # noqa: F401
@@ -542,14 +556,48 @@ class App(tk.Tk):
                 except Exception:
                     can_impersonate = False
                 if can_impersonate:
-                    self.events.put(("log", "🛡 Site com proteção anti-robô (Cloudflare) — tentando de novo imitando o Chrome…"))
-                    success, err2 = self._attempt(yt_dlp, url, mode, quality_label, out_dir, playlist,
-                                                  cookies_browser, embed_meta, ffmpeg_path,
-                                                  embed_ok=ffprobe_ok, impersonate="chrome")
-                    if success or err2:
-                        err = err2
+                    ladder = [
+                        (dict(impersonate="chrome"),
+                         "imitando o Chrome"),
+                        (dict(impersonate="chrome", generic_impersonate=True),
+                         "imitando o Chrome + ajuste do extrator genérico"),
+                    ]
+                    if not cookies_browser:
+                        ladder += [
+                            (dict(impersonate="chrome", generic_impersonate=True, cookies_browser="chrome"),
+                             "imitação + cookies do Chrome"),
+                            (dict(impersonate="chrome", generic_impersonate=True, cookies_browser="firefox"),
+                             "imitação + cookies do Firefox"),
+                        ]
+                    for kwargs, label in ladder:
+                        if success or err == "__cancelled__" or not is_cloudflare_error(err or ""):
+                            break
+                        self.events.put(("log", f"🛡 Proteção anti-robô (Cloudflare) — tentando de novo: {label}…"))
+                        kw = dict(kwargs)
+                        cb = kw.pop("cookies_browser", cookies_browser)
+                        s2, e2 = self._attempt(yt_dlp, url, mode, quality_label, out_dir, playlist,
+                                               cb, embed_meta, ffmpeg_path,
+                                               embed_ok=ffprobe_ok, **kw)
+                        success = s2
+                        if e2:
+                            err = e2
                 else:
                     self.events.put(("log", "ℹ Este site pede imitação de navegador (curl-cffi não embutido neste build). Atualize o workflow e gere o próximo build."))
+            # Escada do Instagram: erro de "empty media response" = quer login via cookies.
+            # Se o usuário não escolheu cookies, tenta Chrome e depois Firefox sozinho.
+            if not success and err and not cookies_browser and is_instagram_auth_error(url, err):
+                for browser in ("chrome", "firefox"):
+                    if success or err == "__cancelled__":
+                        break
+                    self.events.put(("log", f"🔑 Instagram pediu login — tentando com os cookies do {browser}…"))
+                    s2, e2 = self._attempt(yt_dlp, url, mode, quality_label, out_dir, playlist,
+                                           browser, embed_meta, ffmpeg_path,
+                                           embed_ok=ffprobe_ok, impersonate=None)
+                    success = s2
+                    if e2:
+                        err = e2
+                if not success:
+                    self.events.put(("log", "ℹ Pra valer: entre no Instagram pelo **Firefox** uma vez (login) e deixe os cookies salvos — o Chrome novo bloqueia a leitura dos cookies por outros programas; o Firefox não."))
             # Retentativa de segurança: se o erro citar ffprobe, tenta sem embutir
             if not success and err and "ffprobe" in err:
                 self.events.put(("log", "↪ Tentando de novo sem embutir capa/metadados…"))
@@ -567,17 +615,19 @@ class App(tk.Tk):
             else:
                 fail += 1
                 hint = ""
-                if "instagram.com" in url and any(s in (err or "") for s in ("login", "Login", "rate", "Rate")):
-                    hint = "\n   Dica: no Instagram, selecione os cookies do navegador (Chrome/Edge) nas opções e tente de novo."
+                if "instagram.com" in url:
+                    hint = "\n   Dica: entre no Instagram pelo Firefox (login) e nas opções do app escolha cookies = firefox — é o caminho mais confiável hoje."
                 self.events.put(("log", f"❌ Falhou: {url}\n   Motivo: {(err or '')[:300]}{hint}"))
         self.events.put(("done", ok, fail))
 
     def _attempt(self, yt_dlp, url, mode, quality_label, out_dir, playlist,
-                 cookies_browser, embed_meta, ffmpeg_path, embed_ok, impersonate):
+                 cookies_browser, embed_meta, ffmpeg_path, embed_ok, impersonate,
+                 generic_impersonate=False):
         """Uma tentativa de download. Retorna (sucesso, mensagem_de_erro)."""
         opts = build_ydl_opts(mode, quality_label, out_dir, playlist,
                               cookies_browser, embed_meta, self._progress_hook, ffmpeg_path,
-                              embed_ok=embed_ok, impersonate=impersonate)
+                              embed_ok=embed_ok, impersonate=impersonate,
+                              generic_impersonate=generic_impersonate)
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([url])
