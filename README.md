@@ -21,6 +21,12 @@ Facebook, X (Twitter), Vimeo, Twitch e +1.000 outros (motor: **yt-dlp** + **ffmp
 > Se o workflow não puder ser criado pela integração, crie o arquivo manualmente pela interface web
 > do GitHub com o mesmo conteúdo — cópia dele em `WORKFLOW-BUILD-WINDOWS.yml.txt` na raiz.
 
+## Versões
+- **v1.1.0** — correção do travamento ("não respondendo"): progresso limitado a ~3 atualizações/segundo,
+  fila de eventos da tela processada em lotes, Colar via mecanismo interno do Tk + menu de botão direito,
+  e log de diagnóstico em `%LOCALAPPDATA%\DXDownloader\dx-downloader.log`.
+- **v1.0.0** — primeira versão.
+
 ## Uso
 Use apenas para baixar conteúdo que você tem direito de baixar / para uso pessoal.
 

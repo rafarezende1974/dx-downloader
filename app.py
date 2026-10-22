@@ -1,26 +1,56 @@
 # DX Downloader - Baixador de vídeos e áudios (Windows)
 # DX Labs - usa yt-dlp como motor (YouTube, TikTok, Instagram, Facebook, X, Vimeo e +1000 sites)
 # GUI em Tkinter puro (sem dependências extras) + ffmpeg embutido no .exe para juntar vídeo/áudio e gerar MP3.
+#
+# v1.1.0 - correção do travamento ("não respondendo"):
+#  - progresso do download LIMITADO (máx. ~3 atualizações/segundo) e a fila de eventos da tela
+#    é esvaziada em lotes pequenos -> a thread principal nunca fica soterrada de atualizações.
+#  - Colar reescrito: usa o mecanismo interno do Tk (<<Paste>>) e menu de botão direito;
+#    a leitura direta da área de transferência virou só plano B, com proteção.
+#  - Log em arquivo (%LOCALAPPDATA%\DXDownloader\dx-downloader.log) pra diagnóstico.
 
 import os
 import sys
+import time
 import queue
 import threading
 import webbrowser
+from datetime import datetime
 from pathlib import Path
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 APP_NAME = "DX Downloader"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 BG = "#0B0E13"
 BG2 = "#151A22"
 FG = "#E8ECF1"
-ACCENT = "#E63946"   # vermelho (programa/ação principal)
-ACCENT2 = "#2EC4B6"  # verde-água (sucesso/progresso)
+ACCENT = "#E63946"
+ACCENT2 = "#2EC4B6"
 MUTED = "#8A94A6"
+
+
+def log_dir() -> Path:
+    base = os.environ.get("LOCALAPPDATA") or str(Path.home())
+    d = Path(base) / "DXDownloader"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        d = Path.home()
+    return d
+
+
+LOG_FILE = log_dir() / "dx-downloader.log"
+
+
+def log_file(msg: str):
+    try:
+        with LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(f"{datetime.now().isoformat(timespec='seconds')} {msg}\n")
+    except Exception:
+        pass
 
 
 def bundled_ffmpeg() -> str | None:
@@ -33,7 +63,7 @@ def bundled_ffmpeg() -> str | None:
     for c in candidates:
         if c.exists():
             return str(c)
-    return None  # yt-dlp procura no PATH se ffmpeg_location for None
+    return None
 
 
 def default_download_dir() -> Path:
@@ -59,15 +89,13 @@ QUALITY_HEIGHTS = {
 def build_ydl_opts(mode: str, quality_label: str, out_dir: str,
                    playlist: bool, cookies_browser: str | None,
                    embed_meta: bool, progress_hook, ffmpeg_path: str | None) -> dict:
-    """Monta as opções do yt-dlp conforme as escolhas da tela.
-
-    mode: 'video' | 'mp3' | 'm4a'
-    """
+    """Monta as opções do yt-dlp conforme as escolhas da tela. mode: 'video' | 'mp3' | 'm4a'"""
     opts: dict = {
         "outtmpl": str(Path(out_dir) / "%(title)s [%(id)s].%(ext)s"),
         "noplaylist": not playlist,
         "retries": 10,
         "fragment_retries": 10,
+        "socket_timeout": 30,
         "continuedl": True,
         "windowsfilenames": True,
         "progress_hooks": [progress_hook],
@@ -122,6 +150,7 @@ class CancelledError(Exception):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
+        log_file(f"=== app iniciou v{APP_VERSION} ===")
         self.title(f"{APP_NAME}  v{APP_VERSION} — DX Labs")
         self.geometry("780x660")
         self.minsize(680, 560)
@@ -131,12 +160,14 @@ class App(tk.Tk):
         self.worker: threading.Thread | None = None
         self.cancel_flag = threading.Event()
         self.last_dir: Path = default_download_dir()
+        # limitador de progresso (anti-travamento)
+        self._prog_last_pct = -10.0
+        self._prog_last_ts = 0.0
 
         self._build_style()
         self._build_ui()
         self.after(100, self._poll_events)
 
-    # ---------- estilo ----------
     def _build_style(self):
         style = ttk.Style(self)
         try:
@@ -149,19 +180,16 @@ class App(tk.Tk):
         style.configure("Title.TLabel", background=BG, foreground=FG, font=("Segoe UI", 17, "bold"))
         style.configure("Sub.TLabel", background=BG, foreground=MUTED, font=("Segoe UI", 9))
         style.configure("Card.TLabel", background=BG2, foreground=FG, font=("Segoe UI", 10))
-        style.configure("CardSub.TLabel", background=BG2, foreground=MUTED, font=("Segoe UI", 9))
         style.configure("TRadiobutton", background=BG2, foreground=FG, font=("Segoe UI", 10))
         style.configure("TCheckbutton", background=BG2, foreground=FG, font=("Segoe UI", 10))
         style.configure("Accent.TButton", font=("Segoe UI", 11, "bold"), padding=(18, 9))
         style.configure("TButton", font=("Segoe UI", 10), padding=(12, 7))
         style.configure("Bar.Horizontal.TProgressbar", troughcolor=BG2, background=ACCENT2, thickness=14)
 
-    # ---------- tela ----------
     def _build_ui(self):
         root = ttk.Frame(self, padding=16)
         root.pack(fill="both", expand=True)
         root.columnconfigure(0, weight=1)
-        root.rowconfigure(3, weight=1)
 
         ttk.Label(root, text="⬇  DX DOWNLOADER", style="Title.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(root, text="Baixe vídeos e áudios do YouTube, TikTok, Instagram, Facebook, X, Vimeo e +1.000 sites.  •  DX Labs",
@@ -171,17 +199,22 @@ class App(tk.Tk):
         card.grid(row=2, column=0, sticky="ew")
         card.columnconfigure(0, weight=1)
 
-        ttk.Label(card, text="Cole um ou mais links (um por linha):", style="Card.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(card, text="Cole um ou mais links (um por linha) — Ctrl+V ou botão direito → Colar:",
+                  style="Card.TLabel").grid(row=0, column=0, sticky="w")
         self.url_text = tk.Text(card, height=5, bg="#0E1219", fg=FG, insertbackground=FG,
-                                font=("Segoe UI", 10), relief="flat", wrap="word")
+                                font=("Segoe UI", 10), relief="flat", wrap="word", undo=False)
         self.url_text.grid(row=1, column=0, sticky="ew", pady=(4, 8))
+        # menu de botão direito no campo de links
+        self._url_menu = tk.Menu(self.url_text, tearoff=0)
+        self._url_menu.add_command(label="Colar", command=self._paste)
+        self._url_menu.add_command(label="Limpar tudo", command=lambda: self.url_text.delete("1.0", "end"))
+        self.url_text.bind("<Button-3>", lambda e: self._url_menu.tk_popup(e.x_root, e.y_root))
 
         btns = ttk.Frame(card, style="Card.TFrame")
         btns.grid(row=2, column=0, sticky="w", pady=(0, 8))
         ttk.Button(btns, text="Colar da área de transferência", command=self._paste).pack(side="left")
         ttk.Button(btns, text="Limpar", command=lambda: self.url_text.delete("1.0", "end")).pack(side="left", padx=(8, 0))
 
-        # modo + qualidade
         opts_row = ttk.Frame(card, style="Card.TFrame")
         opts_row.grid(row=3, column=0, sticky="w")
         self.mode = tk.StringVar(value="video")
@@ -196,7 +229,6 @@ class App(tk.Tk):
         self.quality.set("Melhor disponível")
         self.quality.pack(side="left", padx=(4, 0))
 
-        # pasta destino
         dest_row = ttk.Frame(card, style="Card.TFrame")
         dest_row.grid(row=4, column=0, sticky="ew", pady=(10, 0))
         dest_row.columnconfigure(1, weight=1)
@@ -205,7 +237,6 @@ class App(tk.Tk):
         ttk.Entry(dest_row, textvariable=self.dest_var).grid(row=0, column=1, sticky="ew", padx=(6, 6))
         ttk.Button(dest_row, text="Escolher…", command=self._choose_dir).grid(row=0, column=2)
 
-        # opções extras
         extra = ttk.Frame(card, style="Card.TFrame")
         extra.grid(row=5, column=0, sticky="w", pady=(10, 0))
         self.playlist_var = tk.BooleanVar(value=False)
@@ -218,7 +249,6 @@ class App(tk.Tk):
         self.cookies_box.set("Nenhum")
         self.cookies_box.pack(side="left", padx=(4, 0))
 
-        # ações + progresso (fora do card)
         actions = ttk.Frame(root, padding=(0, 12, 0, 0))
         actions.grid(row=4, column=0, sticky="ew")
         actions.columnconfigure(1, weight=1)
@@ -239,22 +269,34 @@ class App(tk.Tk):
         self.log.grid(row=8, column=0, sticky="nsew")
         root.rowconfigure(8, weight=1)
 
-    # ---------- helpers de UI ----------
+    # ---------- helpers ----------
     def _sync_quality(self):
         self.quality.configure(state="readonly" if self.mode.get() == "video" else "disabled")
 
     def _paste(self):
+        """Cola sem travar: primeiro o mecanismo interno do Tk; plano B lê o clipboard com proteção."""
+        log_file("colar acionado")
         try:
+            self.url_text.focus_set()
+            self.url_text.event_generate("<<Paste>>")
+        except Exception as e:
+            log_file(f"<<Paste>> falhou: {e}")
+        # plano B: se nada entrou em 300ms, tenta ler o clipboard uma vez
+        self.after(300, self._paste_fallback)
+
+    def _paste_fallback(self):
+        try:
+            if self.url_text.get("1.0", "end").strip():
+                return  # <<Paste>> funcionou
             txt = self.clipboard_get()
-        except Exception:
-            txt = ""
-        if txt.strip():
-            cur = self.url_text.get("1.0", "end").strip()
-            self.url_text.delete("1.0", "end")
-            self.url_text.insert("1.0", (cur + "\n" + txt.strip()) if cur else txt.strip())
+            if txt and txt.strip():
+                self.url_text.insert("end", txt.strip())
+                log_file("colar via clipboard_get (plano B)")
+        except Exception as e:
+            log_file(f"plano B do colar falhou (ok se clipboard vazio/sem texto): {e}")
 
     def _choose_dir(self):
-        d = filedialog.askdirectory(initialdir=self.dest_var.get() or str(Path.home()))
+        d = filedialog.askdirectory(parent=self, initialdir=self.dest_var.get() or str(Path.home()))
         if d:
             self.dest_var.set(d)
 
@@ -267,6 +309,7 @@ class App(tk.Tk):
             webbrowser.open(str(p))
 
     def _log(self, msg: str):
+        log_file(msg)
         self.log.configure(state="normal")
         self.log.insert("end", msg + "\n")
         self.log.see("end")
@@ -280,16 +323,18 @@ class App(tk.Tk):
     def _start(self):
         urls = self._get_urls()
         if not urls:
-            messagebox.showwarning(APP_NAME, "Cole pelo menos um link válido (começando com https://).")
+            messagebox.showwarning(APP_NAME, "Cole pelo menos um link válido (começando com https://).", parent=self)
             return
         out_dir = self.dest_var.get().strip()
         if not out_dir:
-            messagebox.showwarning(APP_NAME, "Escolha a pasta onde salvar.")
+            messagebox.showwarning(APP_NAME, "Escolha a pasta onde salvar.", parent=self)
             return
         Path(out_dir).mkdir(parents=True, exist_ok=True)
         self.last_dir = Path(out_dir)
 
         self.cancel_flag.clear()
+        self._prog_last_pct = -10.0
+        self._prog_last_ts = 0.0
         self.btn_download.configure(state="disabled")
         self.btn_cancel.configure(state="normal")
         self.progress["value"] = 0
@@ -320,7 +365,12 @@ class App(tk.Tk):
             total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
             done = d.get("downloaded_bytes", 0)
             pct = (done / total * 100) if total else 0
-            self.events.put(("progress", pct, d.get("filename", ""), d.get("_speed_str", ""), d.get("_eta_str", "")))
+            # LIMITADOR anti-travamento: no máximo ~3 atualizações/segundo ou a cada +1%
+            now = time.monotonic()
+            if pct - self._prog_last_pct >= 1.0 or now - self._prog_last_ts >= 0.33:
+                self._prog_last_pct = pct
+                self._prog_last_ts = now
+                self.events.put(("progress", pct, d.get("filename", ""), d.get("_speed_str", ""), d.get("_eta_str", "")))
         elif status == "finished":
             self.events.put(("log", f"✔ Download concluído: {Path(d.get('filename','')).name} — processando (juntar/extrair)…"))
         elif status == "started":
@@ -328,13 +378,15 @@ class App(tk.Tk):
 
     def _run_downloads(self, urls, mode, quality_label, out_dir, playlist, cookies_browser, embed_meta):
         try:
-            import yt_dlp  # importado aqui pra erro de instalação aparecer no log da tela
+            import yt_dlp
+            log_file(f"yt-dlp {yt_dlp.version.__version__}")
         except Exception as e:
             self.events.put(("error", f"yt-dlp não encontrado: {e}"))
             return
 
         ffmpeg_path = bundled_ffmpeg()
-        if not ffmpeg_path and mode in ("video", "mp3", "m4a"):
+        log_file(f"ffmpeg: {ffmpeg_path or 'nao localizado'}")
+        if not ffmpeg_path:
             self.events.put(("log", "⚠ ffmpeg.exe não localizado ao lado do app — vídeos separados de áudio podem não juntar. Use o .exe oficial do build."))
 
         ok, fail = 0, 0
@@ -357,11 +409,13 @@ class App(tk.Tk):
                 self.events.put(("log", f"❌ Falhou: {url}\n   Motivo: {str(e)[:300]}"))
         self.events.put(("done", ok, fail))
 
-    # ---------- eventos da thread -> UI ----------
+    # ---------- eventos da thread -> UI (em LOTES, pra nunca soterrar a tela) ----------
     def _poll_events(self):
+        processed = 0
         try:
-            while True:
+            while processed < 80:  # lote máximo por ciclo
                 ev = self.events.get_nowait()
+                processed += 1
                 kind = ev[0]
                 if kind == "progress":
                     _, pct, fname, speed, eta = ev
@@ -378,13 +432,15 @@ class App(tk.Tk):
                     self._finish_ui()
                 elif kind == "done":
                     _, ok, fail = ev
-                    self.progress["value"] = 100 if ok and not fail else self.progress["value"]
+                    if ok and not fail:
+                        self.progress["value"] = 100
                     self.status_var.set(f"Concluído: {ok} ok • {fail} falha(s). Arquivos em: {self.dest_var.get()}")
                     self._log(f"— Fim: {ok} concluído(s), {fail} falha(s) —")
                     self._finish_ui()
         except queue.Empty:
             pass
-        self.after(100, self._poll_events)
+        # se ainda tem fila, volta logo; senão, ritmo normal
+        self.after(50 if processed >= 80 else 100, self._poll_events)
 
     def _finish_ui(self):
         self.btn_download.configure(state="normal")
