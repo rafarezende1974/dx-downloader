@@ -22,6 +22,10 @@ Facebook, X (Twitter), Vimeo, Twitch e +1.000 outros (motor: **yt-dlp** + **ffmp
 > do GitHub com o mesmo conteúdo — cópia dele em `WORKFLOW-BUILD-WINDOWS.yml.txt` na raiz.
 
 ## Versões
+- **v1.3.0** — v1.2 acabou com o travamento, mas o colar voltava vazio (Win32 cru fora da thread da janela
+  não lê o clipboard OLE dos navegadores). Agora a leitura tenta **PowerShell `Get-Clipboard`** primeiro
+  (caminho .NET/STA do próprio Windows) e Win32 com COM (STA) como reserva, com retorno visível na tela
+  ("Lendo a área de transferência…" / aviso no Registro se voltar vazio) e cada tentativa registrada no log.
 - **v1.2.0** — travamento era NO COLAR (Ctrl+V e botão, confirmado pelo Rafael): as duas vias usavam a leitura
   de clipboard do Tk na thread da tela. Agora o Ctrl+V/botão/menu leem o clipboard direto pela API do Windows
   (Win32) numa **thread separada com limite de 2s** — a tela nunca espera o clipboard.

@@ -14,6 +14,7 @@ import sys
 import time
 import ctypes
 import queue
+import subprocess
 import threading
 import webbrowser
 from datetime import datetime
@@ -23,7 +24,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 APP_NAME = "DX Downloader"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 BG = "#0B0E13"
 BG2 = "#151A22"
@@ -64,6 +65,14 @@ def read_clipboard_text_windows(timeout_s: float = 2.0) -> str | None:
     Fora do Windows, retorna None (usado só nos testes)."""
     if sys.platform != "win32":
         return None
+    # COM em modo STA nesta thread: sem isso, o clipboard entregue via OLE
+    # (navegadores) pode voltar vazio quando lido fora da thread da janela.
+    _com_ready = False
+    try:
+        hr = ctypes.windll.ole32.CoInitializeEx(None, 2)  # COINIT_APARTMENTTHREADED
+        _com_ready = hr in (0, 1)  # S_OK / S_FALSE
+    except Exception:
+        pass
     user32 = ctypes.windll.user32
     kernel32 = ctypes.windll.kernel32
     user32.OpenClipboard.argtypes = [ctypes.c_void_p]
@@ -92,11 +101,51 @@ def read_clipboard_text_windows(timeout_s: float = 2.0) -> str | None:
         if not ptr:
             return None
         try:
-            return ctypes.c_wchar_p(ptr).value
+            result = ctypes.c_wchar_p(ptr).value
         finally:
             kernel32.GlobalUnlock(handle)
+        return result
     finally:
         user32.CloseClipboard()
+        if _com_ready:
+            try:
+                ctypes.windll.ole32.CoUninitialize()
+            except Exception:
+                pass
+
+
+def read_clipboard_via_powershell(timeout_s: float = 6.0) -> str | None:
+    """Lê o clipboard com o Get-Clipboard do PowerShell (o caminho .NET/STA que o
+    próprio Windows usa — lê o clipboard OLE dos navegadores sem travar e sem voltar vazio)."""
+    if sys.platform != "win32":
+        return None
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", "Get-Clipboard -Raw"],
+            capture_output=True, timeout=timeout_s,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        out = r.stdout.decode("utf-8", errors="replace").rstrip("\r\n")
+        log_file(f"powershell Get-Clipboard: rc={r.returncode} len={len(out)} "
+                 f"stderr={r.stderr.decode('utf-8', errors='replace')[:200]!r}")
+        return out or None
+    except Exception as e:
+        log_file(f"powershell Get-Clipboard falhou: {e}")
+        return None
+
+
+def read_clipboard_text() -> str | None:
+    """Tenta os métodos em ordem e registra cada um no log: PowerShell, depois Win32."""
+    txt = read_clipboard_via_powershell()
+    if txt:
+        log_file(f"clipboard ok via PowerShell ({len(txt)} caracteres)")
+        return txt
+    txt = read_clipboard_text_windows()
+    if txt:
+        log_file(f"clipboard ok via Win32 ({len(txt)} caracteres)")
+        return txt
+    log_file("clipboard: nenhum metodo retornou texto")
+    return None
 
 
 def bundled_ffmpeg() -> str | None:
@@ -335,13 +384,13 @@ class App(tk.Tk):
         if self._paste_busy:
             return
         self._paste_busy = True
+        self.status_var.set("Lendo a área de transferência…")
         log_file("colar acionado (thread separada)")
         threading.Thread(target=self._paste_worker, daemon=True).start()
 
     def _paste_worker(self):
         try:
-            txt = read_clipboard_text_windows(timeout_s=2.0)
-            log_file(f"clipboard lido: {'ok, ' + str(len(txt)) + ' caracteres' if txt else 'vazio/sem texto'}")
+            txt = read_clipboard_text()
             self.events.put(("paste_result", txt or ""))
         except Exception as e:
             log_file(f"erro lendo clipboard: {e}")
@@ -350,7 +399,8 @@ class App(tk.Tk):
     def _apply_paste(self, txt: str):
         self._paste_busy = False
         if not txt.strip():
-            self.status_var.set("Área de transferência vazia ou sem texto — copie o link e tente de novo.")
+            self.status_var.set("Não consegui ler o link copiado — copie de novo e tente outra vez.")
+            self._log("⚠ Colar: a área de transferência voltou vazia/sem texto. Copie o link de novo e tente outra vez.")
             return
         cur = self.url_text.get("1.0", "end").strip()
         self.url_text.delete("1.0", "end")
