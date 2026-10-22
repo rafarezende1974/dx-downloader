@@ -24,7 +24,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 APP_NAME = "DX Downloader"
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.6.1"
 
 BG = "#0B0E13"
 BG2 = "#151A22"
@@ -388,14 +388,22 @@ class App(tk.Tk):
         self.meta_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(extra, text="Baixar playlist inteira", variable=self.playlist_var).pack(side="left")
         ttk.Checkbutton(extra, text="Embutir capa/metadados", variable=self.meta_var).pack(side="left", padx=(14, 0))
-        ttk.Label(extra, text="   Cookies do navegador (p/ Instagram/TikTok com login):", style="Card.TLabel").pack(side="left")
-        self.cookies_box = ttk.Combobox(extra, values=["Nenhum", "chrome", "edge", "firefox", "brave", "cookies.txt"],
-                                        state="readonly", width=10)
+        # Linha PRÓPRIA pros cookies (na v1.6 ficava apertada na linha dos checkboxes
+        # e o botão do arquivo podia sumir da tela)
+        extra2 = ttk.Frame(card, style="Card.TFrame")
+        extra2.grid(row=6, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(extra2, text="Cookies (Instagram/TikTok com login, sites com Cloudflare):",
+                  style="Card.TLabel").pack(side="left")
+        self.cookies_box = ttk.Combobox(extra2, values=["Nenhum", "chrome", "edge", "firefox", "brave", "cookies.txt"],
+                                        state="readonly", width=12)
         self.cookies_box.set("Nenhum")
-        self.cookies_box.pack(side="left", padx=(4, 0))
+        self.cookies_box.pack(side="left", padx=(6, 0))
+        self.cookies_box.bind("<<ComboboxSelected>>", self._on_cookies_selected)
         self.cookies_file = None
-        self.btn_cookies_file = ttk.Button(extra, text="Arquivo…", command=self._choose_cookies_file)
-        self.btn_cookies_file.pack(side="left", padx=(4, 0))
+        self.cookies_file_var = tk.StringVar(value="")
+        self.btn_cookies_file = ttk.Button(extra2, text="Arquivo…", command=self._choose_cookies_file)
+        self.btn_cookies_file.pack(side="left", padx=(6, 0))
+        ttk.Label(extra2, textvariable=self.cookies_file_var, style="Card.TLabel").pack(side="left", padx=(6, 0))
 
         actions = ttk.Frame(root, padding=(0, 12, 0, 0))
         actions.grid(row=4, column=0, sticky="ew")
@@ -455,13 +463,22 @@ class App(tk.Tk):
         self.url_text.focus_set()
         log_file("link colado na tela")
 
+    def _on_cookies_selected(self, _event=None):
+        # Escolheu "cookies.txt" na lista → abre a janela de escolher o arquivo na hora
+        if self.cookies_box.get() == "cookies.txt" and not self.cookies_file:
+            self._choose_cookies_file()
+
     def _choose_cookies_file(self):
         f = filedialog.askopenfilename(parent=self, title="Escolher o arquivo cookies.txt",
                                        filetypes=[("Cookies", "*.txt"), ("Todos", "*.*")])
         if f:
             self.cookies_file = f
             self.cookies_box.set("cookies.txt")
+            self.cookies_file_var.set(Path(f).name)
             self._log(f"🍪 Arquivo de cookies selecionado: {f}")
+        elif not self.cookies_file:
+            # Cancelou sem arquivo nenhum: volta pra "Nenhum" pra não travar o BAIXAR
+            self.cookies_box.set("Nenhum")
 
     def _choose_dir(self):
         d = filedialog.askdirectory(parent=self, initialdir=self.dest_var.get() or str(Path.home()))

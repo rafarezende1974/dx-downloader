@@ -22,6 +22,9 @@ Facebook, X (Twitter), Vimeo, Twitch e +1.000 outros (motor: **yt-dlp** + **ffmp
 > do GitHub com o mesmo conteúdo — cópia dele em `WORKFLOW-BUILD-WINDOWS.yml.txt` na raiz.
 
 ## Versões
+- **v1.6.1** — cookies ganharam **linha própria** na tela (na v1.6 ficavam apertados na linha dos
+  checkboxes e o botão do arquivo podia ficar fora da vista). Escolher "cookies.txt" na lista já abre a
+  janela de escolher o arquivo, e o nome do arquivo escolhido aparece ao lado do botão.
 - **v1.6.0** — cookies de verdade: nova opção **cookies.txt** nas opções (exporta do navegador logado com uma
   extensão tipo "Get cookies.txt LOCALLY" e aponta o arquivo no app — não depende de ler o banco do navegador).
   Escadas mais teimosas: erro de LEITURA de cookies ("Could not copy Chrome cookie database", navegador aberto
