@@ -12,6 +12,7 @@
 import os
 import sys
 import time
+import ctypes
 import queue
 import threading
 import webbrowser
@@ -22,7 +23,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 APP_NAME = "DX Downloader"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 BG = "#0B0E13"
 BG2 = "#151A22"
@@ -51,6 +52,51 @@ def log_file(msg: str):
             f.write(f"{datetime.now().isoformat(timespec='seconds')} {msg}\n")
     except Exception:
         pass
+
+
+CF_UNICODETEXT = 13
+
+
+def read_clipboard_text_windows(timeout_s: float = 2.0) -> str | None:
+    """Lê o texto da área de transferência DIRETO pela API do Windows (Win32),
+    com tentativas limitadas — pensado pra rodar numa thread separada, NUNCA na tela.
+    Retorna None se não houver texto ou se o clipboard estiver ocupado além do limite.
+    Fora do Windows, retorna None (usado só nos testes)."""
+    if sys.platform != "win32":
+        return None
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    user32.OpenClipboard.argtypes = [ctypes.c_void_p]
+    user32.OpenClipboard.restype = ctypes.c_bool
+    user32.GetClipboardData.argtypes = [ctypes.c_uint]
+    user32.GetClipboardData.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+
+    deadline = time.monotonic() + timeout_s
+    opened = False
+    while time.monotonic() < deadline:
+        if user32.OpenClipboard(None):
+            opened = True
+            break
+        time.sleep(0.05)  # outro programa está com o clipboard aberto; tenta de novo sem travar nada
+    if not opened:
+        log_file("clipboard: OpenClipboard nao conseguiu dentro do limite")
+        return None
+    try:
+        handle = user32.GetClipboardData(CF_UNICODETEXT)
+        if not handle:
+            return None
+        ptr = kernel32.GlobalLock(handle)
+        if not ptr:
+            return None
+        try:
+            return ctypes.c_wchar_p(ptr).value
+        finally:
+            kernel32.GlobalUnlock(handle)
+    finally:
+        user32.CloseClipboard()
 
 
 def bundled_ffmpeg() -> str | None:
@@ -163,6 +209,7 @@ class App(tk.Tk):
         # limitador de progresso (anti-travamento)
         self._prog_last_pct = -10.0
         self._prog_last_ts = 0.0
+        self._paste_busy = False
 
         self._build_style()
         self._build_ui()
@@ -209,6 +256,11 @@ class App(tk.Tk):
         self._url_menu.add_command(label="Colar", command=self._paste)
         self._url_menu.add_command(label="Limpar tudo", command=lambda: self.url_text.delete("1.0", "end"))
         self.url_text.bind("<Button-3>", lambda e: self._url_menu.tk_popup(e.x_root, e.y_root))
+        # Ctrl+V / Shift+Insert / <<Paste>> passam pelo NOSSO colar assíncrono (nunca o do Tk)
+        self.url_text.bind("<Control-v>", self._on_paste_key)
+        self.url_text.bind("<Control-V>", self._on_paste_key)
+        self.url_text.bind("<Shift-Insert>", self._on_paste_key)
+        self.url_text.bind("<<Paste>>", self._on_paste_key)
 
         btns = ttk.Frame(card, style="Card.TFrame")
         btns.grid(row=2, column=0, sticky="w", pady=(0, 8))
@@ -273,27 +325,38 @@ class App(tk.Tk):
     def _sync_quality(self):
         self.quality.configure(state="readonly" if self.mode.get() == "video" else "disabled")
 
-    def _paste(self):
-        """Cola sem travar: primeiro o mecanismo interno do Tk; plano B lê o clipboard com proteção."""
-        log_file("colar acionado")
-        try:
-            self.url_text.focus_set()
-            self.url_text.event_generate("<<Paste>>")
-        except Exception as e:
-            log_file(f"<<Paste>> falhou: {e}")
-        # plano B: se nada entrou em 300ms, tenta ler o clipboard uma vez
-        self.after(300, self._paste_fallback)
+    def _on_paste_key(self, _event=None):
+        self._paste()
+        return "break"  # impede o colar nativo do Tk (que travava a tela)
 
-    def _paste_fallback(self):
+    def _paste(self):
+        """Colar ASSÍNCRONO (v1.2): o clipboard é lido pela API do Windows numa thread
+        separada, com limite de 2s. A tela nunca espera o clipboard — nada de congelar."""
+        if self._paste_busy:
+            return
+        self._paste_busy = True
+        log_file("colar acionado (thread separada)")
+        threading.Thread(target=self._paste_worker, daemon=True).start()
+
+    def _paste_worker(self):
         try:
-            if self.url_text.get("1.0", "end").strip():
-                return  # <<Paste>> funcionou
-            txt = self.clipboard_get()
-            if txt and txt.strip():
-                self.url_text.insert("end", txt.strip())
-                log_file("colar via clipboard_get (plano B)")
+            txt = read_clipboard_text_windows(timeout_s=2.0)
+            log_file(f"clipboard lido: {'ok, ' + str(len(txt)) + ' caracteres' if txt else 'vazio/sem texto'}")
+            self.events.put(("paste_result", txt or ""))
         except Exception as e:
-            log_file(f"plano B do colar falhou (ok se clipboard vazio/sem texto): {e}")
+            log_file(f"erro lendo clipboard: {e}")
+            self.events.put(("paste_result", ""))
+
+    def _apply_paste(self, txt: str):
+        self._paste_busy = False
+        if not txt.strip():
+            self.status_var.set("Área de transferência vazia ou sem texto — copie o link e tente de novo.")
+            return
+        cur = self.url_text.get("1.0", "end").strip()
+        self.url_text.delete("1.0", "end")
+        self.url_text.insert("1.0", (cur + "\n" + txt.strip()) if cur else txt.strip())
+        self.url_text.focus_set()
+        log_file("link colado na tela")
 
     def _choose_dir(self):
         d = filedialog.askdirectory(parent=self, initialdir=self.dest_var.get() or str(Path.home()))
@@ -417,7 +480,9 @@ class App(tk.Tk):
                 ev = self.events.get_nowait()
                 processed += 1
                 kind = ev[0]
-                if kind == "progress":
+                if kind == "paste_result":
+                    self._apply_paste(ev[1])
+                elif kind == "progress":
                     _, pct, fname, speed, eta = ev
                     self.progress["value"] = pct
                     name = Path(fname).name if fname else ""

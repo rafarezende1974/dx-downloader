@@ -22,6 +22,9 @@ Facebook, X (Twitter), Vimeo, Twitch e +1.000 outros (motor: **yt-dlp** + **ffmp
 > do GitHub com o mesmo conteúdo — cópia dele em `WORKFLOW-BUILD-WINDOWS.yml.txt` na raiz.
 
 ## Versões
+- **v1.2.0** — travamento era NO COLAR (Ctrl+V e botão, confirmado pelo Rafael): as duas vias usavam a leitura
+  de clipboard do Tk na thread da tela. Agora o Ctrl+V/botão/menu leem o clipboard direto pela API do Windows
+  (Win32) numa **thread separada com limite de 2s** — a tela nunca espera o clipboard.
 - **v1.1.0** — correção do travamento ("não respondendo"): progresso limitado a ~3 atualizações/segundo,
   fila de eventos da tela processada em lotes, Colar via mecanismo interno do Tk + menu de botão direito,
   e log de diagnóstico em `%LOCALAPPDATA%\DXDownloader\dx-downloader.log`.
