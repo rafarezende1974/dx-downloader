@@ -24,7 +24,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 APP_NAME = "DX Downloader"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 
 BG = "#0B0E13"
 BG2 = "#151A22"
@@ -181,10 +181,25 @@ QUALITY_HEIGHTS = {
 }
 
 
+def has_ffprobe(ffmpeg_path: str | None) -> bool:
+    """ffprobe fica ao lado do ffmpeg quando embutido; sem ele, nada de embutir capa/metadados."""
+    if not ffmpeg_path:
+        return False
+    parent = Path(ffmpeg_path).parent
+    return (parent / "ffprobe.exe").exists() or (parent / "ffprobe").exists()
+
+
+def is_cloudflare_error(msg: str) -> bool:
+    return any(s in msg for s in ("impersonate", "Cloudflare", "HTTP Error 403"))
+
+
 def build_ydl_opts(mode: str, quality_label: str, out_dir: str,
                    playlist: bool, cookies_browser: str | None,
-                   embed_meta: bool, progress_hook, ffmpeg_path: str | None) -> dict:
-    """Monta as opções do yt-dlp conforme as escolhas da tela. mode: 'video' | 'mp3' | 'm4a'"""
+                   embed_meta: bool, progress_hook, ffmpeg_path: str | None,
+                   embed_ok: bool = True, impersonate: str | None = None) -> dict:
+    """Monta as opções do yt-dlp conforme as escolhas da tela. mode: 'video' | 'mp3' | 'm4a'
+    embed_ok=False pula capa/metadados (quando falta o ffprobe) em vez de falhar o download.
+    impersonate='chrome' imita o navegador (exige curl-cffi) — usado na retentativa anti-Cloudflare."""
     opts: dict = {
         "outtmpl": str(Path(out_dir) / "%(title)s [%(id)s].%(ext)s"),
         "noplaylist": not playlist,
@@ -202,6 +217,9 @@ def build_ydl_opts(mode: str, quality_label: str, out_dir: str,
         opts["ffmpeg_location"] = ffmpeg_path
     if cookies_browser:
         opts["cookiesfrombrowser"] = (cookies_browser,)
+    if impersonate:
+        opts["impersonate"] = impersonate
+    embed = embed_meta and embed_ok
 
     if mode == "video":
         h = QUALITY_HEIGHTS.get(quality_label)
@@ -211,7 +229,7 @@ def build_ydl_opts(mode: str, quality_label: str, out_dir: str,
             fmt = "bv*+ba/b"
         opts["format"] = fmt
         opts["merge_output_format"] = "mp4"
-        if embed_meta:
+        if embed:
             opts["postprocessors"] = [
                 {"key": "FFmpegMetadata", "add_metadata": True},
                 {"key": "EmbedThumbnail", "already_have_thumbnail": False},
@@ -220,7 +238,7 @@ def build_ydl_opts(mode: str, quality_label: str, out_dir: str,
     elif mode == "mp3":
         opts["format"] = "ba/b"
         pp = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]
-        if embed_meta:
+        if embed:
             pp += [
                 {"key": "FFmpegMetadata", "add_metadata": True},
                 {"key": "EmbedThumbnail", "already_have_thumbnail": False},
@@ -230,7 +248,7 @@ def build_ydl_opts(mode: str, quality_label: str, out_dir: str,
     elif mode == "m4a":
         opts["format"] = "ba[ext=m4a]/ba/b"
         pp = [{"key": "FFmpegExtractAudio", "preferredcodec": "m4a", "preferredquality": "192"}]
-        if embed_meta:
+        if embed:
             pp += [{"key": "FFmpegMetadata", "add_metadata": True}]
         opts["postprocessors"] = pp
     return opts
@@ -498,29 +516,76 @@ class App(tk.Tk):
             return
 
         ffmpeg_path = bundled_ffmpeg()
-        log_file(f"ffmpeg: {ffmpeg_path or 'nao localizado'}")
+        ffprobe_ok = has_ffprobe(ffmpeg_path)
+        log_file(f"ffmpeg: {ffmpeg_path or 'nao localizado'} | ffprobe: {'ok' if ffprobe_ok else 'ausente'}")
         if not ffmpeg_path:
             self.events.put(("log", "⚠ ffmpeg.exe não localizado ao lado do app — vídeos separados de áudio podem não juntar. Use o .exe oficial do build."))
+        elif not ffprobe_ok:
+            self.events.put(("log", "ℹ ffprobe não embutido nesta versão: downloads normais, mas sem embutir capa/metadados (corrigido no próximo build)."))
 
         ok, fail = 0, 0
         for i, url in enumerate(urls, 1):
             if self.cancel_flag.is_set():
                 break
             self.events.put(("status", f"Baixando {i}/{len(urls)}: {url}"))
-            opts = build_ydl_opts(mode, quality_label, out_dir, playlist,
-                                  cookies_browser, embed_meta, self._progress_hook, ffmpeg_path)
-            try:
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    ydl.download([url])
-                ok += 1
-                self.events.put(("log", f"✅ Pronto: {url}"))
-            except CancelledError:
+            success, err = self._attempt(yt_dlp, url, mode, quality_label, out_dir, playlist,
+                                         cookies_browser, embed_meta, ffmpeg_path,
+                                         embed_ok=ffprobe_ok, impersonate=None)
+            if err == "__cancelled__":
                 self.events.put(("log", "⏹ Cancelado pelo usuário."))
                 break
-            except Exception as e:
+            # Retentativa anti-Cloudflare: imita o Chrome (precisa do curl-cffi embutido)
+            if not success and err and is_cloudflare_error(err):
+                try:
+                    import curl_cffi  # noqa: F401
+                    can_impersonate = True
+                except Exception:
+                    can_impersonate = False
+                if can_impersonate:
+                    self.events.put(("log", "🛡 Site com proteção anti-robô (Cloudflare) — tentando de novo imitando o Chrome…"))
+                    success, err2 = self._attempt(yt_dlp, url, mode, quality_label, out_dir, playlist,
+                                                  cookies_browser, embed_meta, ffmpeg_path,
+                                                  embed_ok=ffprobe_ok, impersonate="chrome")
+                    if success or err2:
+                        err = err2
+                else:
+                    self.events.put(("log", "ℹ Este site pede imitação de navegador (curl-cffi não embutido neste build). Atualize o workflow e gere o próximo build."))
+            # Retentativa de segurança: se o erro citar ffprobe, tenta sem embutir
+            if not success and err and "ffprobe" in err:
+                self.events.put(("log", "↪ Tentando de novo sem embutir capa/metadados…"))
+                success, err2 = self._attempt(yt_dlp, url, mode, quality_label, out_dir, playlist,
+                                              cookies_browser, embed_meta, ffmpeg_path,
+                                              embed_ok=False, impersonate=None)
+                if success or err2:
+                    err = err2
+            if err == "__cancelled__":
+                self.events.put(("log", "⏹ Cancelado pelo usuário."))
+                break
+            if success:
+                ok += 1
+                self.events.put(("log", f"✅ Pronto: {url}"))
+            else:
                 fail += 1
-                self.events.put(("log", f"❌ Falhou: {url}\n   Motivo: {str(e)[:300]}"))
+                hint = ""
+                if "instagram.com" in url and any(s in (err or "") for s in ("login", "Login", "rate", "Rate")):
+                    hint = "\n   Dica: no Instagram, selecione os cookies do navegador (Chrome/Edge) nas opções e tente de novo."
+                self.events.put(("log", f"❌ Falhou: {url}\n   Motivo: {(err or '')[:300]}{hint}"))
         self.events.put(("done", ok, fail))
+
+    def _attempt(self, yt_dlp, url, mode, quality_label, out_dir, playlist,
+                 cookies_browser, embed_meta, ffmpeg_path, embed_ok, impersonate):
+        """Uma tentativa de download. Retorna (sucesso, mensagem_de_erro)."""
+        opts = build_ydl_opts(mode, quality_label, out_dir, playlist,
+                              cookies_browser, embed_meta, self._progress_hook, ffmpeg_path,
+                              embed_ok=embed_ok, impersonate=impersonate)
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([url])
+            return True, None
+        except CancelledError:
+            return False, "__cancelled__"
+        except Exception as e:
+            return False, str(e)
 
     # ---------- eventos da thread -> UI (em LOTES, pra nunca soterrar a tela) ----------
     def _poll_events(self):

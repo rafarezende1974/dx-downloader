@@ -22,20 +22,23 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Download ffmpeg (para juntar vídeo+áudio e gerar MP3)
+      - name: Download ffmpeg + ffprobe (juntar vídeo/áudio, gerar MP3 e embutir capa/metadados)
         shell: pwsh
         run: |
           Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile "ffmpeg.zip"
           Expand-Archive -Path "ffmpeg.zip" -DestinationPath "ffmpeg_extracted"
-          $exe = Get-ChildItem -Path "ffmpeg_extracted" -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
-          Copy-Item $exe.FullName -Destination "ffmpeg.exe"
+          foreach ($name in @("ffmpeg.exe", "ffprobe.exe")) {
+            $f = Get-ChildItem -Path "ffmpeg_extracted" -Recurse -Filter $name | Select-Object -First 1
+            Copy-Item $f.FullName -Destination $name
+          }
           .\ffmpeg.exe -version
+          .\ffprobe.exe -version
 
       - name: Generate icon
         run: python generate_icon.py
 
       - name: Build EXE (PyInstaller, arquivo único)
-        run: pyinstaller --noconfirm --clean --onefile --windowed --name DXDownloader --icon assets/icon.ico --add-binary "ffmpeg.exe;." --collect-all yt_dlp app.py
+        run: pyinstaller --noconfirm --clean --onefile --windowed --name DXDownloader --icon assets/icon.ico --add-binary "ffmpeg.exe;." --add-binary "ffprobe.exe;." --collect-all yt_dlp --collect-all curl_cffi app.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

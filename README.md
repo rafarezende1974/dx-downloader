@@ -22,6 +22,10 @@ Facebook, X (Twitter), Vimeo, Twitch e +1.000 outros (motor: **yt-dlp** + **ffmp
 > do GitHub com o mesmo conteúdo — cópia dele em `WORKFLOW-BUILD-WINDOWS.yml.txt` na raiz.
 
 ## Versões
+- **v1.4.0** — dois erros de download corrigidos: (1) Instagram falhava com "ffprobe not found" porque só o
+  ffmpeg estava embutido — o **ffprobe.exe entra no build** (passo do workflow) e, se faltar, o app **pula
+  capa/metadados em vez de falhar**; (2) sites com Cloudflare (ex.: Artlist, 403) ganham **retentativa
+  automática imitando o Chrome** (novo pacote curl-cffi nas dependências + `--collect-all curl_cffi` no workflow).
 - **v1.3.0** — v1.2 acabou com o travamento, mas o colar voltava vazio (Win32 cru fora da thread da janela
   não lê o clipboard OLE dos navegadores). Agora a leitura tenta **PowerShell `Get-Clipboard`** primeiro
   (caminho .NET/STA do próprio Windows) e Win32 com COM (STA) como reserva, com retorno visível na tela
